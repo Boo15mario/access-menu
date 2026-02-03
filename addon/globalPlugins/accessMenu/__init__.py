@@ -3,9 +3,19 @@
 
 import os
 import subprocess
+import sys
+import tempfile
+import uuid
+import threading
 
 import wx
 import addonHandler
+try:
+    import comtypes
+    import comtypes.client as comtypes_client
+except Exception:
+    comtypes = None
+    comtypes_client = None
 import gui
 import ui
 import config
@@ -40,10 +50,15 @@ log.info("Access Menu add-on: module imported")
 
 APP_EXTENSIONS = {".lnk", ".url", ".appref-ms"}
 
+GOD_MODE_CLSID = "ED7BA470-8E54-465E-825C-99712043E01C"
+GOD_MODE_SHELL = f"shell:::{GOD_MODE_CLSID}"
+_HELPER_EXE_MISSING_LOGGED = False
+
 CONFIG_SECTION = "accessMenu"
 CONFIG_SPEC = {
     "appsLabel": "string(default='Apps')",
     "powerLabel": "string(default='Power')",
+    "settingsLabel": "string(default='Settings')",
     "folderPrefix": "string(default='Folder: ')",
     "searchLabel": "string(default='Search...')",
     "allAppsLabel": "string(default='All Apps (A-Z)')",
@@ -134,6 +149,499 @@ def _get_cfg(key):
     return config.conf[CONFIG_SECTION].get(key, CONFIG_SPEC[key].split("default='", 1)[1].split("'")[0])
 
 
+def _open_god_mode_folder():
+    try:
+        subprocess.Popen(["explorer.exe", GOD_MODE_SHELL])
+    except OSError:
+        try:
+            os.startfile(GOD_MODE_SHELL)
+        except OSError:
+            subprocess.Popen(["explorer.exe"])
+
+
+def _get_powershell_candidates():
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidates = []
+    if sys.maxsize <= 2**32:
+        candidates.append(os.path.join(system_root, "Sysnative", "WindowsPowerShell", "v1.0", "powershell.exe"))
+    candidates.append(os.path.join(system_root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"))
+    candidates.append("powershell")
+    return candidates
+
+
+def _get_helper_exe():
+    bin_dir = os.path.join(os.path.dirname(__file__), "bin")
+    exe_path = os.path.join(bin_dir, "godmode_helper.exe")
+    if os.path.isfile(exe_path):
+        return exe_path
+    return None
+
+
+def _get_cscript_candidates():
+    system_root = os.environ.get("SystemRoot", r"C:\Windows")
+    candidates = []
+    if sys.maxsize <= 2**32:
+        candidates.append(os.path.join(system_root, "Sysnative", "cscript.exe"))
+    candidates.append(os.path.join(system_root, "System32", "cscript.exe"))
+    candidates.append("cscript")
+    return candidates
+
+
+def _get_god_mode_items_via_powershell():
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as temp_file:
+            temp_path = temp_file.name
+    except Exception:
+        log.exception("Access Menu: failed to create temp file for PowerShell output.")
+        return []
+
+    escaped_path = temp_path.replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject Shell.Application
+$folder = $shell.NameSpace('shell:::{GOD_MODE_CLSID}')
+if ($null -eq $folder) {{
+    [System.IO.File]::WriteAllText('{escaped_path}', '', (New-Object System.Text.UTF8Encoding($false)))
+    exit
+}}
+$items = @()
+foreach ($item in $folder.Items()) {{
+    if ($null -ne $item -and $item.Name) {{
+        $items += $item.Name
+    }}
+}}
+[System.IO.File]::WriteAllLines('{escaped_path}', $items, (New-Object System.Text.UTF8Encoding($false)))
+"""
+    result = None
+    ps_exe = None
+    try:
+        for candidate in _get_powershell_candidates():
+            try:
+                ps_exe = candidate
+                result = subprocess.run(
+                    [
+                        candidate,
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-STA",
+                        "-Command",
+                        script,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        if result is None:
+            log.warning("Access Menu: PowerShell executable not found.")
+            return []
+    except Exception:
+        log.exception("Access Menu: failed to run PowerShell for God Mode enumeration.")
+        return []
+
+    if result.returncode != 0:
+        log.warning("Access Menu: PowerShell God Mode enumeration failed: %s", result.stderr.strip())
+        return []
+
+    payload = ""
+    try:
+        if temp_path and os.path.exists(temp_path):
+            with open(temp_path, "r", encoding="utf-8", errors="replace") as handle:
+                payload = handle.read()
+    except Exception:
+        log.exception("Access Menu: failed to read PowerShell output file.")
+        payload = ""
+    finally:
+        try:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+
+    if not payload.strip():
+        log.warning(
+            "Access Menu: PowerShell God Mode enumeration returned empty output. exe=%s stderr=%s",
+            ps_exe,
+            (result.stderr or "").strip(),
+        )
+        return []
+    results = []
+    for line in payload.splitlines():
+        name = line.strip()
+        if name:
+            results.append((name, name))
+    results.sort(key=lambda kv: kv[0].casefold())
+    return results
+
+
+def _get_god_mode_items_via_helper():
+    global _HELPER_EXE_MISSING_LOGGED
+    exe_path = _get_helper_exe()
+    if not exe_path:
+        if not _HELPER_EXE_MISSING_LOGGED:
+            log.warning("Access Menu: helper exe not found in addon bin directory.")
+            _HELPER_EXE_MISSING_LOGGED = True
+        return []
+    try:
+        result = subprocess.run(
+            [exe_path],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+    except OSError as exc:
+        log.warning("Access Menu: helper exe failed to launch: %s", exc)
+        return []
+
+    if result.returncode != 0:
+        log.warning("Access Menu: helper exe failed: %s", (result.stderr or "").strip())
+        return []
+
+    lines = []
+    for line in (result.stdout or "").splitlines():
+        name = line.strip()
+        if name:
+            lines.append(name)
+    if not lines:
+        log.warning("Access Menu: helper exe returned no items.")
+        return []
+
+    # Deduplicate while preserving order.
+    seen = set()
+    results = []
+    for name in lines:
+        key = name.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        results.append((name, name))
+    results.sort(key=lambda kv: kv[0].casefold())
+    log.info("Access Menu: helper exe returned %d items.", len(results))
+    return results
+
+
+def _get_god_mode_items_via_cscript():
+    temp_path = None
+    script_path = None
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".txt") as temp_file:
+            temp_path = temp_file.name
+        script_name = f"godmode-{uuid.uuid4().hex}.vbs"
+        script_path = os.path.join(tempfile.gettempdir(), script_name)
+        escaped_path = temp_path.replace('"', '""')
+        script = (
+            'On Error Resume Next\n'
+            'Dim shell, folder, items, fso, outFile\n'
+            'Set shell = CreateObject("Shell.Application")\n'
+            f'Set folder = shell.NameSpace("shell:::{GOD_MODE_CLSID}")\n'
+            'If folder Is Nothing Then WScript.Quit 0\n'
+            'Set items = folder.Items()\n'
+            'Set fso = CreateObject("Scripting.FileSystemObject")\n'
+            f'Set outFile = fso.CreateTextFile("{escaped_path}", True, True)\n'
+            'For Each item In items\n'
+            '  If Not item Is Nothing Then\n'
+            '    If Len(item.Name) > 0 Then outFile.WriteLine item.Name\n'
+            '  End If\n'
+            'Next\n'
+            'outFile.Close\n'
+        )
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(script)
+
+        result = None
+        for candidate in _get_cscript_candidates():
+            try:
+                result = subprocess.run(
+                    [candidate, "//NoLogo", script_path],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        if result is None:
+            log.warning("Access Menu: cscript executable not found.")
+            return []
+        if result.returncode != 0:
+            log.warning("Access Menu: cscript God Mode enumeration failed: %s", (result.stderr or "").strip())
+            return []
+
+        if not temp_path or not os.path.exists(temp_path):
+            log.warning("Access Menu: cscript output file not created.")
+            return []
+        try:
+            with open(temp_path, "r", encoding="utf-16", errors="replace") as handle:
+                payload = handle.read()
+        except Exception:
+            log.exception("Access Menu: failed to read cscript output file.")
+            return []
+        if not payload.strip():
+            log.warning("Access Menu: cscript God Mode enumeration returned empty output.")
+            return []
+        results = []
+        for line in payload.splitlines():
+            name = line.strip()
+            if name:
+                results.append((name, name))
+        results.sort(key=lambda kv: kv[0].casefold())
+        return results
+    finally:
+        try:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        try:
+            if script_path and os.path.exists(script_path):
+                os.remove(script_path)
+        except Exception:
+            pass
+
+
+def _run_in_sta_thread(action, name="AccessMenuSTA"):
+    result = {"value": None, "error": None}
+    done = threading.Event()
+
+    def runner():
+        try:
+            if comtypes is not None:
+                comtypes.CoInitialize()
+            result["value"] = action()
+        except Exception as exc:
+            result["error"] = exc
+        finally:
+            if comtypes is not None:
+                try:
+                    comtypes.CoUninitialize()
+                except Exception:
+                    pass
+            done.set()
+
+    thread = threading.Thread(target=runner, name=name)
+    thread.daemon = True
+    thread.start()
+    done.wait()
+    if result["error"] is not None:
+        log.exception("Access Menu: STA thread action failed.", exc_info=result["error"])
+    return result["value"]
+
+
+def _get_god_mode_items_via_com_sta():
+    if comtypes_client is None:
+        return []
+
+    def action():
+        shell = comtypes_client.CreateObject("Shell.Application")
+        folder = shell.NameSpace(GOD_MODE_SHELL)
+        if not folder:
+            return []
+        try:
+            items = folder.Items()
+        except Exception:
+            return []
+        results = []
+        for item in items:
+            try:
+                name = item.Name
+            except Exception:
+                continue
+            if name:
+                results.append((name, name))
+        results.sort(key=lambda kv: kv[0].casefold())
+        return results
+
+    return _run_in_sta_thread(action, name="AccessMenuSTA-Enum") or []
+
+
+def _invoke_god_mode_item_by_name(name):
+    if not name:
+        return
+
+    exe_path = _get_helper_exe()
+    if exe_path:
+        try:
+            result = subprocess.run(
+                [exe_path, "--invoke", name],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+            )
+            if result.returncode == 0:
+                return
+            log.warning(
+                "Access Menu: helper exe failed to invoke item (%s): %s",
+                name,
+                (result.stderr or "").strip(),
+            )
+        except OSError as exc:
+            log.warning("Access Menu: helper exe failed to launch for invoke: %s", exc)
+
+    def action():
+        if comtypes_client is None:
+            return False
+        shell = comtypes_client.CreateObject("Shell.Application")
+        folder = shell.NameSpace(GOD_MODE_SHELL)
+        if not folder:
+            return False
+        item = folder.ParseName(name)
+        if not item:
+            return False
+        try:
+            item.InvokeVerb()
+            return True
+        except Exception:
+            return False
+
+    if _run_in_sta_thread(action, name="AccessMenuSTA-Invoke"):
+        return
+
+    safe_name = name.replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$shell = New-Object -ComObject Shell.Application
+$folder = $shell.NameSpace('shell:::{GOD_MODE_CLSID}')
+if ($null -eq $folder) {{ exit 2 }}
+$item = $folder.ParseName('{safe_name}')
+if ($null -eq $item) {{ exit 3 }}
+$item.InvokeVerb()
+"""
+    result = None
+    ps_exe = None
+    try:
+        for candidate in _get_powershell_candidates():
+            try:
+                ps_exe = candidate
+                result = subprocess.run(
+                    [
+                        candidate,
+                        "-NoLogo",
+                        "-NoProfile",
+                        "-NonInteractive",
+                        "-ExecutionPolicy",
+                        "Bypass",
+                        "-STA",
+                        "-Command",
+                        script,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        if result is None:
+            log.warning("Access Menu: PowerShell executable not found for invoke.")
+            _invoke_god_mode_item_by_name_via_cscript(name)
+            return
+    except Exception:
+        log.exception("Access Menu: failed to invoke God Mode item via PowerShell.")
+        _invoke_god_mode_item_by_name_via_cscript(name)
+        return
+
+    if result.returncode != 0:
+        log.warning(
+            "Access Menu: PowerShell failed to invoke God Mode item (%s): %s",
+            name,
+            (result.stderr or "").strip(),
+        )
+        _invoke_god_mode_item_by_name_via_cscript(name)
+
+
+def _invoke_god_mode_item_by_name_via_cscript(name):
+    if not name:
+        return
+    script_path = None
+    try:
+        script_name = f"godmode-invoke-{uuid.uuid4().hex}.vbs"
+        script_path = os.path.join(tempfile.gettempdir(), script_name)
+        escaped_name = name.replace('"', '""')
+        script = (
+            'On Error Resume Next\n'
+            'Dim shell, folder, item\n'
+            'Set shell = CreateObject("Shell.Application")\n'
+            f'Set folder = shell.NameSpace("shell:::{GOD_MODE_CLSID}")\n'
+            'If folder Is Nothing Then WScript.Quit 2\n'
+            f'Set item = folder.ParseName("{escaped_name}")\n'
+            'If item Is Nothing Then WScript.Quit 3\n'
+            'item.InvokeVerb\n'
+        )
+        with open(script_path, "w", encoding="utf-8") as handle:
+            handle.write(script)
+
+        result = None
+        for candidate in _get_cscript_candidates():
+            try:
+                result = subprocess.run(
+                    [candidate, "//NoLogo", script_path],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+                break
+            except FileNotFoundError:
+                continue
+        if result is None:
+            log.warning("Access Menu: cscript executable not found for invoke.")
+            return
+        if result.returncode != 0:
+            log.warning(
+                "Access Menu: cscript failed to invoke God Mode item (%s): %s",
+                name,
+                (result.stderr or "").strip(),
+            )
+    finally:
+        try:
+            if script_path and os.path.exists(script_path):
+                os.remove(script_path)
+        except Exception:
+            pass
+
+def _get_god_mode_items():
+    results = _get_god_mode_items_via_helper()
+    shell = None
+    if results:
+        log.info("Access Menu: God Mode enumeration succeeded via helper exe.")
+    else:
+        results = _get_god_mode_items_via_com_sta()
+        if results:
+            log.info("Access Menu: God Mode enumeration succeeded via COM STA.")
+
+    if not results:
+        results = _get_god_mode_items_via_powershell()
+        if results:
+            log.info("Access Menu: God Mode enumeration succeeded via PowerShell.")
+        else:
+            results = _get_god_mode_items_via_cscript()
+            if results:
+                log.info("Access Menu: God Mode enumeration succeeded via cscript.")
+            else:
+                log.warning("Access Menu: God Mode enumeration returned no items.")
+    else:
+        results.sort(key=lambda kv: kv[0].casefold())
+
+    return shell, results
+
+
 class AccessMenuSettingsPanel(SettingsPanel):
     title = "Access Menu"
 
@@ -145,6 +653,8 @@ class AccessMenuSettingsPanel(SettingsPanel):
         self.appsLabelCtrl.SetValue(_get_cfg("appsLabel"))
         self.powerLabelCtrl = helper.addLabeledControl("Power label", wx.TextCtrl)
         self.powerLabelCtrl.SetValue(_get_cfg("powerLabel"))
+        self.settingsLabelCtrl = helper.addLabeledControl("Settings label", wx.TextCtrl)
+        self.settingsLabelCtrl.SetValue(_get_cfg("settingsLabel"))
         self.folderPrefixCtrl = helper.addLabeledControl("Folder prefix", wx.TextCtrl)
         self.folderPrefixCtrl.SetValue(_get_cfg("folderPrefix"))
         self.searchLabelCtrl = helper.addLabeledControl("Search label", wx.TextCtrl)
@@ -184,6 +694,7 @@ class AccessMenuSettingsPanel(SettingsPanel):
         conf = config.conf[CONFIG_SECTION]
         conf["appsLabel"] = self.appsLabelCtrl.GetValue()
         conf["powerLabel"] = self.powerLabelCtrl.GetValue()
+        conf["settingsLabel"] = self.settingsLabelCtrl.GetValue()
         conf["folderPrefix"] = self.folderPrefixCtrl.GetValue()
         conf["searchLabel"] = self.searchLabelCtrl.GetValue()
         conf["allAppsLabel"] = self.allAppsLabelCtrl.GetValue()
@@ -333,6 +844,11 @@ class AccessMenuDialog(wx.Dialog):
         power_label = _get_cfg("powerLabel")
         idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"⚡ {power_label}")
         self.items.append(("category", "power", None))
+
+        # Add Settings (God Mode)
+        settings_label = _get_cfg("settingsLabel")
+        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"⚙️ {settings_label}")
+        self.items.append(("category", "settings", None))
         
         # Auto-size column
         self.listCtrl.SetColumnWidth(0, wx.LIST_AUTOSIZE)
@@ -359,6 +875,10 @@ class AccessMenuDialog(wx.Dialog):
             elif item_data == "power":
                 # Show power submenu
                 dlg = PowerMenuDialog(self, self.plugin)
+                dlg.ShowModal()
+                dlg.Destroy()
+            elif item_data == "settings":
+                dlg = SettingsMenuDialog(self, self.plugin)
                 dlg.ShowModal()
                 dlg.Destroy()
         
@@ -450,6 +970,107 @@ class AppsMenuDialog(wx.Dialog):
             if self.GetParent():
                 self.GetParent().EndModal(wx.ID_OK)
     
+    def OnCancel(self, event):
+        self.EndModal(wx.ID_CANCEL)
+
+
+class SettingsMenuDialog(wx.Dialog):
+    """Dialog for Settings (God Mode) submenu"""
+
+    def __init__(self, parent, plugin):
+        super().__init__(parent, title=_get_cfg("settingsLabel"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+        self.plugin = plugin
+        self._shell, self.items = _get_god_mode_items()
+        self._empty_item = None
+        if not self.items:
+            self._empty_item = _("No settings items available")
+            self.items = [(self._empty_item, None)]
+
+        mainSizer = wx.BoxSizer(wx.VERTICAL)
+
+        self.listCtrl = wx.ListCtrl(self, style=wx.LC_REPORT | wx.LC_SINGLE_SEL | wx.LC_NO_HEADER)
+        self.listCtrl.InsertColumn(0, "Item")
+        self.listCtrl.SetMinSize((600, 400))
+
+        self._populate_list()
+
+        mainSizer.Add(self.listCtrl, proportion=1, flag=wx.EXPAND | wx.ALL, border=10)
+
+        buttonSizer = wx.BoxSizer(wx.HORIZONTAL)
+        self.okButton = wx.Button(self, wx.ID_OK, "OK")
+        self.cancelButton = wx.Button(self, wx.ID_CANCEL, "Cancel")
+        buttonSizer.Add(self.okButton, flag=wx.RIGHT, border=5)
+        buttonSizer.Add(self.cancelButton)
+        mainSizer.Add(buttonSizer, flag=wx.ALIGN_RIGHT | wx.ALL, border=10)
+
+        self.SetSizer(mainSizer)
+        self.Fit()
+        self.Centre()
+
+        self.listCtrl.Bind(wx.EVT_LIST_ITEM_ACTIVATED, self.OnActivate)
+        self.okButton.Bind(wx.EVT_BUTTON, self.OnOK)
+        self.cancelButton.Bind(wx.EVT_BUTTON, self.OnCancel)
+
+        wx.CallAfter(self._announce_dialog)
+
+    def _announce_dialog(self):
+        """Announce the dialog and set focus"""
+        self.listCtrl.SetFocus()
+        count = self.listCtrl.GetItemCount()
+        if count > 0:
+            self.listCtrl.Select(0)
+            self.listCtrl.Focus(0)
+        first_item = self.listCtrl.GetItemText(0) if count > 0 else ""
+        if count == 0:
+            ui.message(f"{_get_cfg('settingsLabel')} dialog. No items available.")
+        elif self._empty_item and count == 1:
+            ui.message(f"{_get_cfg('settingsLabel')} dialog. {first_item}")
+        else:
+            ui.message(f"{_get_cfg('settingsLabel')} dialog. {count} items. {first_item}")
+
+    def _populate_list(self):
+        for name, _item in self.items:
+            self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
+        self.listCtrl.SetColumnWidth(0, wx.LIST_AUTOSIZE)
+
+    def OnActivate(self, event):
+        self.OnOK(event)
+
+    def OnOK(self, event):
+        selected = self.listCtrl.GetFirstSelected()
+        if selected < 0:
+            self.EndModal(wx.ID_CANCEL)
+            return
+
+        if selected >= len(self.items):
+            return
+
+        _label, item = self.items[selected]
+        if item is None:
+            ui.message(_("No settings items available."))
+            return
+        if isinstance(item, str):
+            _invoke_god_mode_item_by_name(item)
+            self.EndModal(wx.ID_OK)
+            if self.GetParent():
+                self.GetParent().EndModal(wx.ID_OK)
+            return
+        try:
+            item.InvokeVerb()
+        except Exception:
+            path = getattr(item, "Path", "")
+            if path:
+                try:
+                    os.startfile(path)
+                except OSError:
+                    subprocess.Popen(["explorer.exe", path])
+            else:
+                _open_god_mode_folder()
+
+        self.EndModal(wx.ID_OK)
+        if self.GetParent():
+            self.GetParent().EndModal(wx.ID_OK)
+
     def OnCancel(self, event):
         self.EndModal(wx.ID_CANCEL)
 
@@ -579,9 +1200,13 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         tree = _build_tree()
         
         # Create and show the dialog
+        gui.mainFrame.prePopup()
         dlg = AccessMenuDialog(gui.mainFrame, tree, self)
-        dlg.ShowModal()
-        dlg.Destroy()
+        try:
+            dlg.ShowModal()
+        finally:
+            dlg.Destroy()
+            gui.mainFrame.postPopup()
 
     def _populate_apps_menu(self, menu):
         tree = _build_tree()
