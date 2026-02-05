@@ -458,27 +458,27 @@ class AccessMenuDialog(wx.Dialog):
         """Populate the list with menu items"""
         # Add Search section
         search_label = _get_cfg("searchLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"🔍 {search_label}")
+        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), search_label)
         self.items.append(("category", "search", self.tree))
         
         # Add Favorites section
         favorites_label = _get_cfg("favoritesLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"⭐ {favorites_label}")
+        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), favorites_label)
         self.items.append(("category", "favorites", None))
         
         # Add Apps section
         apps_label = _get_cfg("appsLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"📁 {apps_label}")
+        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), apps_label)
         self.items.append(("category", "apps", self.tree))
         
         # Add Power section
         power_label = _get_cfg("powerLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"⚡ {power_label}")
+        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), power_label)
         self.items.append(("category", "power", None))
         
         # Add About section
         about_label = _get_cfg("aboutLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"ℹ️ {about_label}")
+        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), about_label)
         self.items.append(("category", "about", None))
         
         # Auto-size column
@@ -754,7 +754,7 @@ class AppsMenuDialog(wx.Dialog):
         
         # Add folders first
         for name, subtree in folders:
-            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"📁 {name}")
+            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
             self.items.append(("folder", name, subtree))
         
         # Add root-level apps
