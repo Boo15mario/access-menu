@@ -71,18 +71,28 @@ def _unique_name(name, existing):
 
 
 def _start_menu_roots():
-    roots = []
-    program_data = os.environ.get("PROGRAMDATA")
-    app_data = os.environ.get("APPDATA")
-    if program_data:
-        roots.append(os.path.join(program_data, "Microsoft", "Windows", "Start Menu", "Programs"))
-    if app_data:
-        roots.append(os.path.join(app_data, "Microsoft", "Windows", "Start Menu", "Programs"))
-    return [r for r in roots if os.path.isdir(r)]
+    path = r"C:\ProgramData\Microsoft\Windows\Start Menu\Programs"
+    return [path] if os.path.isdir(path) else []
 
 
 def _build_tree():
     tree = {}
+    # Track app names that exist in subfolders
+    subfolder_apps = set()
+    
+    # First pass: collect all apps in subfolders
+    for root in _start_menu_roots():
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel = os.path.relpath(dirpath, root)
+            # Skip root level in first pass
+            if rel == ".":
+                continue
+            for filename in filenames:
+                base, ext = os.path.splitext(filename)
+                if ext.lower() in APP_EXTENSIONS:
+                    subfolder_apps.add(base.lower())
+    
+    # Second pass: build tree, skip root duplicates
     for root in _start_menu_roots():
         for dirpath, dirnames, filenames in os.walk(root):
             rel = os.path.relpath(dirpath, root)
@@ -90,10 +100,19 @@ def _build_tree():
             node = tree
             for part in parts:
                 node = node.setdefault(part, {})
+            
+            is_root = (rel == ".")
+            
             for filename in filenames:
                 base, ext = os.path.splitext(filename)
                 if ext.lower() not in APP_EXTENSIONS:
                     continue
+                
+                # Skip root-level apps that exist in subfolders
+                if is_root and base.lower() in subfolder_apps:
+                    log.debug(f"Skipping root duplicate: {base}")
+                    continue
+                
                 path = os.path.join(dirpath, filename)
                 name = _unique_name(base, node)
                 node[name] = path
@@ -372,10 +391,12 @@ class AccessMenuDialog(wx.Dialog):
 class AppsMenuDialog(wx.Dialog):
     """Dialog for Apps submenu"""
     
-    def __init__(self, parent, tree, plugin):
-        super().__init__(parent, title=_get_cfg("appsLabel"), style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
+    def __init__(self, parent, tree, plugin, breadcrumb=""):
+        title = _get_cfg("appsLabel") if not breadcrumb else breadcrumb
+        super().__init__(parent, title=title, style=wx.DEFAULT_DIALOG_STYLE | wx.RESIZE_BORDER)
         self.tree = tree
         self.plugin = plugin
+        self.breadcrumb = breadcrumb
         
         mainSizer = wx.BoxSizer(wx.VERTICAL)
         
@@ -415,15 +436,30 @@ class AppsMenuDialog(wx.Dialog):
         
         count = self.listCtrl.GetItemCount()
         first_item = self.listCtrl.GetItemText(0) if count > 0 else ""
-        ui.message(f"{_get_cfg('appsLabel')} dialog. {count} apps. {first_item}")
+        title = self.breadcrumb if self.breadcrumb else _get_cfg('appsLabel')
+        ui.message(f"{title} dialog. {count} items. {first_item}")
     
     def _populate_list(self):
-        """Populate with all apps sorted A-Z"""
-        apps = _flatten_apps(self.tree)
+        """Populate with folders first, then root-level apps"""
+        folders = []
+        apps = []
         
-        for display_name, path in apps:
-            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), display_name)
-            self.items.append(("app", path))
+        # Separate folders and apps
+        for name, value in _sorted_items(self.tree):
+            if isinstance(value, dict):
+                folders.append((name, value))
+            else:
+                apps.append((name, value))
+        
+        # Add folders first
+        for name, subtree in folders:
+            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), f"📁 {name}")
+            self.items.append(("folder", name, subtree))
+        
+        # Add root-level apps
+        for name, path in apps:
+            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
+            self.items.append(("app", path, None))
         
         self.listCtrl.SetColumnWidth(0, wx.LIST_AUTOSIZE)
     
@@ -436,19 +472,34 @@ class AppsMenuDialog(wx.Dialog):
             self.EndModal(wx.ID_CANCEL)
             return
         
-        item_type, path = self.items[selected]
+        item_type, data, extra = self.items[selected]
         
-        if item_type == "app":
+        if item_type == "folder":
+            # Open subdialog for this folder
+            folder_name = data
+            subtree = extra
+            new_breadcrumb = f"{self.breadcrumb} > {folder_name}" if self.breadcrumb else folder_name
+            dlg = AppsMenuDialog(self, subtree, self.plugin, new_breadcrumb)
+            dlg.ShowModal()
+            dlg.Destroy()
+        elif item_type == "app":
             # Launch the app
+            path = data
+            log.info(f"Attempting to launch: {path}")
             try:
-                os.startfile(path)
-            except OSError:
-                subprocess.Popen(["cmd", "/c", "start", "", path])
+                # Use explorer.exe to launch shortcuts - more reliable than os.startfile
+                subprocess.Popen(["explorer.exe", path], creationflags=subprocess.CREATE_NO_WINDOW)
+                log.info(f"Launch command sent via explorer.exe")
+            except Exception as e:
+                log.error(f"Launch failed: {e}")
+                ui.message(f"Failed to launch application")
             
-            # Close both dialogs
+            # Close all dialogs by propagating up
             self.EndModal(wx.ID_OK)
-            if self.GetParent():
-                self.GetParent().EndModal(wx.ID_OK)
+            parent = self.GetParent()
+            while parent and isinstance(parent, (AppsMenuDialog, AccessMenuDialog)):
+                parent.EndModal(wx.ID_OK)
+                parent = parent.GetParent()
     
     def OnCancel(self, event):
         self.EndModal(wx.ID_CANCEL)
