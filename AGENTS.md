@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 - `addon/manifest.ini` holds NVDA add-on metadata (name, version, min NVDA version).
-- `addon/globalPlugins/accessMenu/__init__.py` contains the global plugin implementation with three dialog classes (AccessMenuDialog, AppsMenuDialog, PowerMenuDialog) and a settings panel.
+- `addon/globalPlugins/accessMenu/__init__.py` contains the global plugin implementation with six dialog classes (AccessMenuDialog, AppsMenuDialog, FavoritesMenuDialog, PowerMenuDialog, AccessMenuSearchDialog, AboutDialog) and a settings panel.
 - `build.sh` packages the add-on into `accessMenu.nvda-addon` at the repo root.
 
 ## Build, Test, and Development Commands
@@ -26,14 +26,19 @@
   - Install the built add-on in NVDA and restart NVDA.
   - Verify Input Gestures shows **Access Menu** > **Open the Access Menu**.
   - Press NVDA+Shift+M to open the main Access Menu dialog.
-  - Test navigation with Up/Down arrows through Apps (136 items) and Power (3 items) dialogs.
-  - Validate dialog announcements, app launching, and power confirmations.
+  - Test navigation with Up/Down arrows through main menu (Search, Favorites, Apps, Power, About).
+  - Test hierarchical Apps menu with folders (folders first, then root-level apps).
+  - Test Search dialog (filter and launch apps).
+  - Test Favorites menu (display and launch favorites).
+  - Test Power menu confirmations (Sign out, Power off, Reboot).
+  - Test About dialog (shows add-on metadata).
+  - Test Settings panel (add/remove/reorder favorites, About button).
+  - Validate dialog announcements, app launching via explorer.exe, and proper navigation.
   - Check that Escape key closes dialogs properly.
 
 ## Commit & Pull Request Guidelines
-- No Git history or conventions are present in this repository.
+- Use conventional commit format: `type: short summary` (e.g., `feat: add search dialog`, `fix: broken shortcut launching`).
 - If adding versioned changes, update `addon/manifest.ini` `version` and rebuild.
-- Suggested commit format (if you initialize Git): `type: short summary` (e.g., `feat: add search dialog`).
 
 ## Configuration & Deployment Notes
 - NVDA loads add-ons from `C:\Users\<User>\AppData\Roaming\NVDA\addons`.
@@ -41,6 +46,10 @@
 - Add-on uses dialog-based UI (wx.Dialog with wx.ListCtrl) for screen reader accessibility.
 - Dialog announcements are handled via ui.message() with wx.CallAfter() for proper timing.
 - Gesture: NVDA+Shift+M opens the main Access Menu dialog.
+- Apps are sourced only from `C:\ProgramData\Microsoft\Windows\Start Menu\Programs`.
+- Root-level duplicates are skipped if same app exists in subfolders.
+- Applications are launched using `explorer.exe` for reliability with .lnk files.
+- Favorites are stored in NVDA config as a list of full paths and persist across sessions.
 
 ---
 
