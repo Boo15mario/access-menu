@@ -139,11 +139,6 @@ def _flatten_apps(tree, prefix=""):
     return apps
 
 
-def _top_level_categories(tree):
-    # Return list of (categoryName, categoryTree)
-    return [(name, value) for name, value in _sorted_items(tree) if isinstance(value, dict)]
-
-
 def _ensure_config():
     if CONFIG_SECTION not in config.conf.spec:
         config.conf.spec[CONFIG_SECTION] = CONFIG_SPEC
@@ -192,11 +187,6 @@ def _remove_favorite(path):
     return False
 
 
-def _is_favorite(path):
-    """Check if a path is in favorites"""
-    return path in _get_favorites()
-
-
 def _get_favorite_apps():
     """Get list of (display_name, path) tuples for favorites"""
     favorites = _get_favorites()
@@ -208,6 +198,37 @@ def _get_favorite_apps():
             name, ext = os.path.splitext(basename)
             apps.append((name, path))
     return apps
+
+
+def _show_modal_dialog(dialog):
+    """Show and always destroy a dialog."""
+    try:
+        return dialog.ShowModal()
+    finally:
+        dialog.Destroy()
+
+
+def _launch_via_explorer(path, attempt_log_label=None):
+    """Launch an app path through explorer.exe for shortcut reliability."""
+    if attempt_log_label:
+        log.info(f"{attempt_log_label}: {path}")
+    try:
+        subprocess.Popen(["explorer.exe", path], creationflags=subprocess.CREATE_NO_WINDOW)
+        if attempt_log_label:
+            log.info("Launch command sent via explorer.exe")
+        return True
+    except Exception as e:
+        log.error(f"Launch failed: {e}")
+        ui.message("Failed to launch application")
+        return False
+
+
+def _close_parent_dialogs(dialog, dialog_types):
+    """Close parent dialogs while they match the allowed dialog types."""
+    parent = dialog.GetParent()
+    while parent and isinstance(parent, dialog_types):
+        parent.EndModal(wx.ID_OK)
+        parent = parent.GetParent()
 
 
 class AccessMenuSettingsPanel(SettingsPanel):
@@ -312,9 +333,7 @@ class AccessMenuSettingsPanel(SettingsPanel):
     
     def onAbout(self, event):
         """Show about dialog"""
-        dlg = AboutDialog(self)
-        dlg.ShowModal()
-        dlg.Destroy()
+        _show_modal_dialog(AboutDialog(self))
 
     def onSave(self):
         # Favorites are saved immediately on add/remove/reorder
@@ -385,18 +404,17 @@ class AccessMenuSearchDialog(wx.Dialog):
             # Just close dialog, don't launch
             self.EndModal(wx.ID_OK)
             return
-        
-        try:
-            subprocess.Popen(["explorer.exe", path], creationflags=subprocess.CREATE_NO_WINDOW)
-        except Exception as e:
-            log.error(f"Launch failed: {e}")
-            ui.message(f"Failed to launch application")
+
+        _launch_via_explorer(path)
         self.EndModal(wx.ID_OK)
 
     def _on_char_hook(self, event):
         key = event.GetKeyCode()
         if key == wx.WXK_ESCAPE:
             self.EndModal(wx.ID_CANCEL)
+            return
+        elif key == wx.WXK_RETURN:
+            self._on_launch(event)
             return
         event.Skip()
 
@@ -456,30 +474,17 @@ class AccessMenuDialog(wx.Dialog):
     
     def _populate_list(self):
         """Populate the list with menu items"""
-        # Add Search section
-        search_label = _get_cfg("searchLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), search_label)
-        self.items.append(("category", "search", self.tree))
-        
-        # Add Favorites section
-        favorites_label = _get_cfg("favoritesLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), favorites_label)
-        self.items.append(("category", "favorites", None))
-        
-        # Add Apps section
-        apps_label = _get_cfg("appsLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), apps_label)
-        self.items.append(("category", "apps", self.tree))
-        
-        # Add Power section
-        power_label = _get_cfg("powerLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), power_label)
-        self.items.append(("category", "power", None))
-        
-        # Add About section
-        about_label = _get_cfg("aboutLabel")
-        idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), about_label)
-        self.items.append(("category", "about", None))
+        categories = [
+            (_get_cfg("searchLabel"), "search", self.tree),
+            (_get_cfg("favoritesLabel"), "favorites", None),
+            (_get_cfg("appsLabel"), "apps", self.tree),
+            (_get_cfg("powerLabel"), "power", None),
+            (_get_cfg("aboutLabel"), "about", None),
+        ]
+
+        for label, category_name, extra in categories:
+            self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), label)
+            self.items.append(("category", category_name, extra))
         
         # Auto-size column
         self.listCtrl.SetColumnWidth(0, wx.LIST_AUTOSIZE)
@@ -495,35 +500,19 @@ class AccessMenuDialog(wx.Dialog):
             self.EndModal(wx.ID_CANCEL)
             return
         
-        item_type, item_data, extra = self.items[selected]
-        
+        item_type, item_data, _extra = self.items[selected]
+
         if item_type == "category":
-            if item_data == "search":
-                # Show search dialog
-                apps = _flatten_apps(self.tree)
-                dlg = AccessMenuSearchDialog(self, apps)
-                dlg.ShowModal()
-                dlg.Destroy()
-            elif item_data == "favorites":
-                # Show favorites submenu
-                dlg = FavoritesMenuDialog(self, self.plugin)
-                dlg.ShowModal()
-                dlg.Destroy()
-            elif item_data == "apps":
-                # Show apps submenu
-                dlg = AppsMenuDialog(self, self.tree, self.plugin)
-                dlg.ShowModal()
-                dlg.Destroy()
-            elif item_data == "power":
-                # Show power submenu
-                dlg = PowerMenuDialog(self, self.plugin)
-                dlg.ShowModal()
-                dlg.Destroy()
-            elif item_data == "about":
-                # Show about dialog
-                dlg = AboutDialog(self)
-                dlg.ShowModal()
-                dlg.Destroy()
+            dialog_builders = {
+                "search": lambda: AccessMenuSearchDialog(self, _flatten_apps(self.tree)),
+                "favorites": lambda: FavoritesMenuDialog(self, self.plugin),
+                "apps": lambda: AppsMenuDialog(self, self.tree, self.plugin),
+                "power": lambda: PowerMenuDialog(self, self.plugin),
+                "about": lambda: AboutDialog(self),
+            }
+            builder = dialog_builders.get(item_data)
+            if builder:
+                _show_modal_dialog(builder())
         
         # Don't close the main dialog, let user choose again or press Cancel
     
@@ -643,11 +632,11 @@ class FavoritesMenuDialog(wx.Dialog):
         
         if not favorite_apps:
             # Show empty message
-            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), "(No favorites)")
+            self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), "(No favorites)")
             self.items.append(("empty", None, None))
         else:
             for name, path in favorite_apps:
-                idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
+                self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
                 self.items.append(("app", path, None))
         
         self.listCtrl.SetColumnWidth(0, wx.LIST_AUTOSIZE)
@@ -670,20 +659,11 @@ class FavoritesMenuDialog(wx.Dialog):
         
         if item_type == "app":
             # Launch the app
-            log.info(f"Launching favorite: {path}")
-            try:
-                subprocess.Popen(["explorer.exe", path], creationflags=subprocess.CREATE_NO_WINDOW)
-                log.info(f"Launch command sent via explorer.exe")
-            except Exception as e:
-                log.error(f"Launch failed: {e}")
-                ui.message(f"Failed to launch application")
+            _launch_via_explorer(path, "Launching favorite")
             
             # Close all dialogs
             self.EndModal(wx.ID_OK)
-            parent = self.GetParent()
-            while parent and isinstance(parent, (AccessMenuDialog,)):
-                parent.EndModal(wx.ID_OK)
-                parent = parent.GetParent()
+            _close_parent_dialogs(self, (AccessMenuDialog,))
     
     def OnCancel(self, event):
         self.EndModal(wx.ID_CANCEL)
@@ -754,12 +734,12 @@ class AppsMenuDialog(wx.Dialog):
         
         # Add folders first
         for name, subtree in folders:
-            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
+            self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
             self.items.append(("folder", name, subtree))
         
         # Add root-level apps
         for name, path in apps:
-            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
+            self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), name)
             self.items.append(("app", path, None))
         
         self.listCtrl.SetColumnWidth(0, wx.LIST_AUTOSIZE)
@@ -780,27 +760,15 @@ class AppsMenuDialog(wx.Dialog):
             folder_name = data
             subtree = extra
             new_breadcrumb = f"{self.breadcrumb} > {folder_name}" if self.breadcrumb else folder_name
-            dlg = AppsMenuDialog(self, subtree, self.plugin, new_breadcrumb)
-            dlg.ShowModal()
-            dlg.Destroy()
+            _show_modal_dialog(AppsMenuDialog(self, subtree, self.plugin, new_breadcrumb))
         elif item_type == "app":
             # Launch the app
             path = data
-            log.info(f"Attempting to launch: {path}")
-            try:
-                # Use explorer.exe to launch shortcuts - more reliable than os.startfile
-                subprocess.Popen(["explorer.exe", path], creationflags=subprocess.CREATE_NO_WINDOW)
-                log.info(f"Launch command sent via explorer.exe")
-            except Exception as e:
-                log.error(f"Launch failed: {e}")
-                ui.message(f"Failed to launch application")
+            _launch_via_explorer(path, "Attempting to launch")
             
             # Close all dialogs by propagating up
             self.EndModal(wx.ID_OK)
-            parent = self.GetParent()
-            while parent and isinstance(parent, (AppsMenuDialog, AccessMenuDialog)):
-                parent.EndModal(wx.ID_OK)
-                parent = parent.GetParent()
+            _close_parent_dialogs(self, (AppsMenuDialog, AccessMenuDialog))
     
     def OnCancel(self, event):
         self.EndModal(wx.ID_CANCEL)
@@ -860,7 +828,7 @@ class PowerMenuDialog(wx.Dialog):
         ]
         
         for label, action in options:
-            idx = self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), label)
+            self.listCtrl.InsertItem(self.listCtrl.GetItemCount(), label)
             self.items.append(("power", action))
         
         self.listCtrl.SetColumnWidth(0, wx.LIST_AUTOSIZE)
@@ -877,23 +845,20 @@ class PowerMenuDialog(wx.Dialog):
         item_type, action = self.items[selected]
         
         if item_type == "power":
-            # Show confirmation dialog
-            if action == "signout":
-                msg = _get_cfg("confirmSignOut")
-            elif action == "poweroff":
-                msg = _get_cfg("confirmPowerOff")
-            elif action == "reboot":
-                msg = _get_cfg("confirmReboot")
-            
+            action_config = {
+                "signout": (_get_cfg("confirmSignOut"), ["shutdown", "/l"]),
+                "poweroff": (_get_cfg("confirmPowerOff"), ["shutdown", "/s", "/t", "0"]),
+                "reboot": (_get_cfg("confirmReboot"), ["shutdown", "/r", "/t", "0"]),
+            }
+            configured_action = action_config.get(action)
+            if not configured_action:
+                return
+            msg, command = configured_action
+
             result = wx.MessageBox(msg, _get_cfg("confirmTitle"), wx.YES_NO | wx.ICON_QUESTION)
             
             if result == wx.YES:
-                if action == "signout":
-                    subprocess.Popen(["shutdown", "/l"])
-                elif action == "poweroff":
-                    subprocess.Popen(["shutdown", "/s", "/t", "0"])
-                elif action == "reboot":
-                    subprocess.Popen(["shutdown", "/r", "/t", "0"])
+                subprocess.Popen(command)
                 
                 # Close all dialogs
                 self.EndModal(wx.ID_OK)
@@ -916,7 +881,6 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         _ensure_config()
         if AccessMenuSettingsPanel not in NVDASettingsDialog.categoryClasses:
             NVDASettingsDialog.categoryClasses.append(AccessMenuSettingsPanel)
-        self._menu_actions = {}
         self.bindGestures(self.__gestures)
         log.info("Access Menu add-on: GlobalPlugin initialized")
 
@@ -931,85 +895,4 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
         tree = _build_tree()
         
         # Create and show the dialog
-        dlg = AccessMenuDialog(gui.mainFrame, tree, self)
-        dlg.ShowModal()
-        dlg.Destroy()
-
-    def _populate_apps_menu(self, menu):
-        tree = _build_tree()
-        search_id = wx.NewIdRef()
-        menu.Append(search_id, _get_cfg("searchLabel"))
-        menu.Bind(wx.EVT_MENU, lambda evt: self._open_search_dialog(tree), id=search_id)
-
-        menu.AppendSeparator()
-
-        all_apps_menu = wx.Menu()
-        self._populate_all_apps_menu(all_apps_menu, tree)
-        menu.AppendSubMenu(all_apps_menu, _get_cfg("allAppsLabel"))
-
-        categories_menu = wx.Menu()
-        self._populate_categories_menu(categories_menu, tree)
-        menu.AppendSubMenu(categories_menu, _get_cfg("categoriesLabel"))
-
-        browse_menu = wx.Menu()
-        self._add_tree_to_menu(browse_menu, tree)
-        menu.AppendSubMenu(browse_menu, _get_cfg("browseFoldersLabel"))
-
-    def _populate_all_apps_menu(self, menu, tree):
-        apps = _flatten_apps(tree)
-        for display, path in apps:
-            item_id = wx.NewIdRef()
-            menu.Append(item_id, display)
-            self._menu_actions[item_id] = path
-            menu.Bind(wx.EVT_MENU, self._on_launch_app, id=item_id)
-
-    def _populate_categories_menu(self, menu, tree):
-        for name, subtree in _top_level_categories(tree):
-            sub_menu = wx.Menu()
-            self._add_tree_to_menu(sub_menu, subtree)
-            menu.AppendSubMenu(sub_menu, name)
-
-    def _add_tree_to_menu(self, menu, tree):
-        for name, value in _sorted_items(tree):
-            if isinstance(value, dict):
-                sub_menu = wx.Menu()
-                self._add_tree_to_menu(sub_menu, value)
-                menu.AppendSubMenu(sub_menu, f"{_get_cfg('folderPrefix')}{name}")
-            else:
-                item_id = wx.NewIdRef()
-                menu.Append(item_id, name)
-                self._menu_actions[item_id] = value
-                menu.Bind(wx.EVT_MENU, self._on_launch_app, id=item_id)
-
-    def _populate_power_menu(self, menu):
-        self._add_power_item(menu, _get_cfg("signOutLabel"), ["shutdown", "/l"], _get_cfg("confirmSignOut"))
-        self._add_power_item(menu, _get_cfg("powerOffLabel"), ["shutdown", "/s", "/t", "0"], _get_cfg("confirmPowerOff"))
-        self._add_power_item(menu, _get_cfg("rebootLabel"), ["shutdown", "/r", "/t", "0"], _get_cfg("confirmReboot"))
-
-    def _add_power_item(self, menu, label, command, prompt):
-        item_id = wx.NewIdRef()
-        menu.Append(item_id, label)
-        menu.Bind(wx.EVT_MENU, lambda evt: self._confirm_and_run(command, prompt), id=item_id)
-
-    def _confirm_and_run(self, command, prompt):
-        result = wx.MessageBox(prompt, _get_cfg("confirmTitle"), style=wx.YES_NO | wx.ICON_QUESTION | wx.CENTER)
-        if result == wx.YES:
-            subprocess.Popen(command)
-
-    def _open_search_dialog(self, tree):
-        apps = _flatten_apps(tree)
-        dlg = AccessMenuSearchDialog(gui.mainFrame, apps)
-        try:
-            dlg.ShowModal()
-        finally:
-            dlg.Destroy()
-
-    def _on_launch_app(self, event):
-        path = self._menu_actions.get(event.GetId())
-        if not path:
-            return
-        try:
-            os.startfile(path)
-        except OSError:
-            # If startfile fails, try shell execute via cmd.
-            subprocess.Popen(["cmd", "/c", "start", "", path])
+        _show_modal_dialog(AccessMenuDialog(gui.mainFrame, tree, self))
