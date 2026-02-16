@@ -47,6 +47,7 @@ CONFIG_SPEC = {
     "appsLabel": "string(default='Apps')",
     "powerLabel": "string(default='Power')",
     "aboutLabel": "string(default='About')",
+    "winutilsLabel": "string(default='WinUtils')",
     "folderPrefix": "string(default='Folder: ')",
     "signOutLabel": "string(default='Sign out')",
     "powerOffLabel": "string(default='Power off')",
@@ -478,6 +479,7 @@ class AccessMenuDialog(wx.Dialog):
             (_get_cfg("searchLabel"), "search", self.tree),
             (_get_cfg("favoritesLabel"), "favorites", None),
             (_get_cfg("appsLabel"), "apps", self.tree),
+            (_get_cfg("winutilsLabel"), "winutils", None),
             (_get_cfg("powerLabel"), "power", None),
             (_get_cfg("aboutLabel"), "about", None),
         ]
@@ -503,6 +505,13 @@ class AccessMenuDialog(wx.Dialog):
         item_type, item_data, _extra = self.items[selected]
 
         if item_type == "category":
+            if item_data == "winutils":
+                self.EndModal(wx.ID_OK)
+                subprocess.Popen(
+                    ["powershell", "-Command", "iwr -useb https://christitus.com/win | iex"],
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return
             dialog_builders = {
                 "search": lambda: AccessMenuSearchDialog(self, _flatten_apps(self.tree)),
                 "favorites": lambda: FavoritesMenuDialog(self, self.plugin),
